@@ -7,6 +7,79 @@
 #include <stdexcept>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+namespace {
+bool EnvIsSet(const char* name) {
+#if defined(_MSC_VER)
+    size_t required = 0;
+    return ::getenv_s(&required, nullptr, 0, name) == 0 && required > 0;
+#else
+    return std::getenv(name) != nullptr;
+#endif
+}
+
+ggml_tensor* ApplyRopeExtNormalInplace(ggml_context* ctx, ggml_tensor* tensor, ggml_tensor* pos, int dim_head) {
+    return ggml_rope_ext_inplace(ctx, tensor, pos, nullptr, dim_head,
+                                 GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+}
+
+ggml_tensor* RestoreDirectRopeFlat(ggml_context* ctx, ggml_tensor* rope_flat,
+                                   int dim_head, int heads, int seq, int batch) {
+    return ggml_view_4d(ctx, rope_flat, dim_head, heads, seq, batch,
+                        rope_flat->nb[1], rope_flat->nb[2],
+                        static_cast<size_t>(seq) * rope_flat->nb[2], 0);
+}
+
+bool CanSplitQkvWeight(const ggml_tensor* weight, int dim_inner) {
+    return weight && weight->ne[1] == 3 * dim_inner;
+}
+
+void LogSplitQkvFallbackOnce(const char* scope, const ggml_tensor* weight, int dim_inner) {
+    static bool logged = false;
+    if (logged) {
+        return;
+    }
+    logged = true;
+    std::cerr << "[Model] QKV weight shape for " << scope << " is ["
+              << (weight ? weight->ne[0] : 0) << ", "
+              << (weight ? weight->ne[1] : 0)
+              << "]; expected second dimension " << 3 * dim_inner
+              << ". Falling back to fused QKV projection." << std::endl;
+}
+
+void SetTensorName(ggml_tensor* tensor, const std::string& name) {
+    if (tensor) {
+        ggml_set_name(tensor, name.c_str());
+    }
+}
+
+ggml_tensor* ConcatBalancedRange(ggml_context* ctx,
+                                 const std::vector<ggml_tensor*>& tensors,
+                                 size_t begin,
+                                 size_t end,
+                                 int dim) {
+    if (begin >= end) {
+        return nullptr;
+    }
+    if (end - begin == 1) {
+        return tensors[begin];
+    }
+
+    size_t mid = begin + (end - begin) / 2;
+    ggml_tensor* left = ConcatBalancedRange(ctx, tensors, begin, mid, dim);
+    ggml_tensor* right = ConcatBalancedRange(ctx, tensors, mid, end, dim);
+    return ggml_concat(ctx, left, right, dim);
+}
+
+ggml_tensor* ConcatBalanced(ggml_context* ctx,
+                            const std::vector<ggml_tensor*>& tensors,
+                            int dim) {
+    return ConcatBalancedRange(ctx, tensors, 0, tensors.size(), dim);
+}
+}
 
 BSRoformer::BSRoformer() {
 }
@@ -18,15 +91,13 @@ BSRoformer::~BSRoformer() {
 }
 
 void BSRoformer::Initialize(const std::string& model_path) {
-    // Use best available backend, but allow forcing CPU
-    if (std::getenv("BSR_FORCE_CPU")) {
-        backend_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
+    if (EnvIsSet("BSR_FORCE_CPU")) {
+        backend_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     } else {
         backend_ = ggml_backend_init_best();
     }
-    
     if (!backend_) {
-        throw std::runtime_error("Failed to initialize backend");
+        throw std::runtime_error("Failed to initialize ggml backend");
     }
     std::cout << "Using backend: " << ggml_backend_name(backend_) << std::endl;
 
@@ -257,7 +328,8 @@ ggml_tensor* BSRoformer::BuildBandSplitGraph(
     
     std::vector<int> dim_inputs = GetDimInputs();
     
-    ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dim_, num_bands_, n_frames, batch);
+    std::vector<ggml_tensor*> projected_bands;
+    projected_bands.reserve(num_bands_);
     
     size_t offset_elements = 0;
     for (int i = 0; i < num_bands_; ++i) {
@@ -298,18 +370,13 @@ ggml_tensor* BSRoformer::BuildBandSplitGraph(
         ggml_tensor* projected = ggml_mul_mat(ctx, weight, normed);
         projected = ggml_add(ctx, projected, bias);
         
-        // Copy to output slice
-        ggml_tensor* out_slice = ggml_view_3d(ctx, x,
-                                              dim_, n_frames, batch,
-                                              x->nb[2], x->nb[3],
-                                              i * x->nb[1]);
-        
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, projected, out_slice));
+        ggml_tensor* projected_band = ggml_reshape_4d(ctx, projected, dim_, 1, n_frames, batch);
+        projected_bands.push_back(projected_band);
         
         offset_elements += dim_in;
     }
     
-    return x;
+    return ConcatBalanced(ctx, projected_bands, 1);
 }
 
 ggml_tensor* BSRoformer::BuildTransformersGraph(
@@ -344,6 +411,8 @@ ggml_tensor* BSRoformer::BuildTransformersGraph(
         // ========== TIME TRANSFORMER ==========
         // Permute: [D, F, T, B] -> [D, T, F, B]
         x = ggml_permute(ctx, x, 0, 2, 1, 3);
+        // Required before reshape: removing this CONT makes ggml_reshape_3d assert
+        // on non-contiguous input in CUDA CTest (test_component_layers/test_inference).
         x = ggml_cont(ctx, x);
         
         int fb = F * B;
@@ -363,61 +432,75 @@ ggml_tensor* BSRoformer::BuildTransformersGraph(
         // blk.{l}.time_attn_qkv.weight
         ggml_tensor* t_qkv_w = GetWeight(time_prefix + "_qkv.weight");
         if (!t_qkv_w) { std::cerr << "Missing: " << time_prefix << "_qkv.weight\n"; return nullptr; }
-        
-        ggml_tensor* qkv_out = ggml_mul_mat(ctx, t_qkv_w, x_norm);
-        
-        // Split QKV
-        ggml_tensor* Q_view = ggml_view_4d(ctx, qkv_out, DIM_HEAD, T, HEADS, fb, 
-                                          qkv_out->nb[1], DIM_HEAD*sizeof(float), qkv_out->nb[2], 0);
-        ggml_tensor* K_view = ggml_view_4d(ctx, qkv_out, DIM_HEAD, T, HEADS, fb,
-                                          qkv_out->nb[1], DIM_HEAD*sizeof(float), qkv_out->nb[2], DIM_INNER*sizeof(float));
-        ggml_tensor* V_view = ggml_view_4d(ctx, qkv_out, DIM_HEAD, T, HEADS, fb,
-                                          qkv_out->nb[1], DIM_HEAD*sizeof(float), qkv_out->nb[2], 2*DIM_INNER*sizeof(float));
-        
-        ggml_tensor* Q = ggml_cont(ctx, Q_view);
-        ggml_tensor* K = ggml_cont(ctx, K_view);
-        ggml_tensor* V = ggml_cont(ctx, V_view);
-        
-        // RoPE with CUDA-compatible reshape
-        // Original Q/K shape: [DIM_HEAD, T, HEADS, fb]
-        // After permute: [DIM_HEAD, HEADS, T, fb]
-        // For CUDA RoPE: reshape to [DIM_HEAD, HEADS, T*fb, 1] and use expanded pos
-        ggml_tensor* Q_perm = ggml_permute(ctx, Q, 0, 2, 1, 3);
-        ggml_tensor* K_perm = ggml_permute(ctx, K, 0, 2, 1, 3);
-        ggml_tensor* Q_perm_cont = ggml_cont(ctx, Q_perm);
-        ggml_tensor* K_perm_cont = ggml_cont(ctx, K_perm);
-        
-        // Reshape to merge batch(fb) into sequence for CUDA RoPE compatibility
+
+        ggml_tensor* V = nullptr;
+        ggml_tensor* time_qk_source = nullptr;
+        size_t time_q_offset = 0;
+        size_t time_k_offset = static_cast<size_t>(DIM_INNER) * sizeof(float);
+        if (CanSplitQkvWeight(t_qkv_w, DIM_INNER)) {
+            ggml_tensor* t_qk_w = ggml_view_2d(ctx, t_qkv_w, t_qkv_w->ne[0], 2 * DIM_INNER,
+                                              t_qkv_w->nb[1], 0);
+            ggml_tensor* t_v_w = ggml_view_2d(ctx, t_qkv_w, t_qkv_w->ne[0], DIM_INNER,
+                                             t_qkv_w->nb[1],
+                                             static_cast<size_t>(2 * DIM_INNER) * t_qkv_w->nb[1]);
+
+            ggml_tensor* qk_out = ggml_mul_mat(ctx, t_qk_w, x_norm);
+            ggml_tensor* v_out = ggml_mul_mat(ctx, t_v_w, x_norm);
+            time_qk_source = qk_out;
+            SetTensorName(qk_out, "t" + std::to_string(layer) + ".qk.mm");
+            SetTensorName(v_out, "t" + std::to_string(layer) + ".v.mm");
+
+            ggml_tensor* V_view = ggml_view_4d(ctx, v_out, DIM_HEAD, T, HEADS, fb,
+                                              v_out->nb[1], DIM_HEAD * sizeof(float), v_out->nb[2], 0);
+            V = V_view;
+            SetTensorName(V, "t" + std::to_string(layer) + ".v.fa");
+        } else {
+            LogSplitQkvFallbackOnce("time attention", t_qkv_w, DIM_INNER);
+            ggml_tensor* qkv_out = ggml_mul_mat(ctx, t_qkv_w, x_norm);
+            time_qk_source = qkv_out;
+            SetTensorName(qkv_out, "t" + std::to_string(layer) + ".qkv.mm");
+
+            ggml_tensor* V_view = ggml_view_4d(ctx, qkv_out, DIM_HEAD, T, HEADS, fb,
+                                              qkv_out->nb[1], DIM_HEAD * sizeof(float), qkv_out->nb[2],
+                                              2 * DIM_INNER * sizeof(float));
+            V = ggml_cont(ctx, V_view);
+            SetTensorName(V, "t" + std::to_string(layer) + ".v.fa");
+        }
+
         int T_fb = T * fb;
-        ggml_tensor* Q_flat = ggml_reshape_4d(ctx, Q_perm_cont, DIM_HEAD, HEADS, T_fb, 1);
-        ggml_tensor* K_flat = ggml_reshape_4d(ctx, K_perm_cont, DIM_HEAD, HEADS, T_fb, 1);
-        
-        // Use passed-in expanded position tensor (caller prepares [T*F*B] with repeating [0..T-1])
-        ggml_tensor* Q_rope_flat = ggml_rope_ext(ctx, Q_flat, pos_time_exp, nullptr, DIM_HEAD, 
-                                                 GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        ggml_tensor* K_rope_flat = ggml_rope_ext(ctx, K_flat, pos_time_exp, nullptr, DIM_HEAD,
-                                                 GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        
-        // Reshape back to [DIM_HEAD, HEADS, T, fb]
-        ggml_tensor* Q_rope_perm = ggml_reshape_4d(ctx, Q_rope_flat, DIM_HEAD, HEADS, T, fb);
-        ggml_tensor* K_rope_perm = ggml_reshape_4d(ctx, K_rope_flat, DIM_HEAD, HEADS, T, fb);
-        
+        ggml_tensor* Q_flat = ggml_view_4d(ctx, time_qk_source, DIM_HEAD, HEADS, T_fb, 1,
+                                           DIM_HEAD * sizeof(float), time_qk_source->nb[1],
+                                           static_cast<size_t>(T_fb) * time_qk_source->nb[1],
+                                           time_q_offset);
+        ggml_tensor* K_flat = ggml_view_4d(ctx, time_qk_source, DIM_HEAD, HEADS, T_fb, 1,
+                                           DIM_HEAD * sizeof(float), time_qk_source->nb[1],
+                                           static_cast<size_t>(T_fb) * time_qk_source->nb[1],
+                                           time_k_offset);
+        SetTensorName(Q_flat, "t" + std::to_string(layer) + ".q.rope.in.direct");
+        SetTensorName(K_flat, "t" + std::to_string(layer) + ".k.rope.in.direct");
+
+        ggml_tensor* Q_rope_flat = ApplyRopeExtNormalInplace(ctx, Q_flat, pos_time_exp, DIM_HEAD);
+        ggml_tensor* K_rope_flat = ApplyRopeExtNormalInplace(ctx, K_flat, pos_time_exp, DIM_HEAD);
+        SetTensorName(Q_rope_flat, "t" + std::to_string(layer) + ".q.rope.out");
+        SetTensorName(K_rope_flat, "t" + std::to_string(layer) + ".k.rope.out");
+
+        ggml_tensor* Q_rope_perm = RestoreDirectRopeFlat(ctx, Q_rope_flat, DIM_HEAD, HEADS, T, fb);
+        ggml_tensor* K_rope_perm = RestoreDirectRopeFlat(ctx, K_rope_flat, DIM_HEAD, HEADS, T, fb);
         ggml_tensor* Q_rope = ggml_permute(ctx, Q_rope_perm, 0, 2, 1, 3);
         ggml_tensor* K_rope = ggml_permute(ctx, K_rope_perm, 0, 2, 1, 3);
+        SetTensorName(Q_rope, "t" + std::to_string(layer) + ".q.fa");
+        SetTensorName(K_rope, "t" + std::to_string(layer) + ".k.fa");
 
         // Flash Attention
         // Inputs: [DIM_HEAD, T, HEADS, fb]
         // Output: [DIM_HEAD, HEADS, T, fb] (permuted)
-        ggml_tensor* Q_fa = ggml_cont(ctx, Q_rope);
-        ggml_tensor* K_fa = ggml_cont(ctx, K_rope);
-        ggml_tensor* V_fa = V; // V is already contiguous [DIM_HEAD, T, HEADS, fb]
+        ggml_tensor* Q_fa = Q_rope;
+        ggml_tensor* K_fa = K_rope;
+        ggml_tensor* V_fa = V; // [DIM_HEAD, T, HEADS, fb]
 
         float scale = 1.0f / sqrtf(static_cast<float>(DIM_HEAD));
         ggml_tensor* attn_out_fa = ggml_flash_attn_ext(ctx, Q_fa, K_fa, V_fa, nullptr, scale, 0.0f, 0.0f);
-        
-        // Permute back to [DIM_HEAD, T, HEADS, fb] to match original flow
-        ggml_tensor* attn_out_perm = ggml_permute(ctx, attn_out_fa, 0, 2, 1, 3);
-        ggml_tensor* attn_out_raw = ggml_cont(ctx, attn_out_perm);
+        SetTensorName(attn_out_fa, "t" + std::to_string(layer) + ".fa.out");
         
         // Gates
         // blk.{l}.time_attn_gate.weight/bias
@@ -428,16 +511,15 @@ ggml_tensor* BSRoformer::BuildTransformersGraph(
         ggml_tensor* gates = ggml_mul_mat(ctx, t_gate_w, x_norm);
         gates = ggml_add(ctx, gates, t_gate_b);
         gates = ggml_sigmoid(ctx, gates);
-        
-        ggml_tensor* gates_perm = ggml_permute(ctx, gates, 1, 0, 2, 3);
-        ggml_tensor* gates_bcast = ggml_view_4d(ctx, gates_perm, 1, T, HEADS, fb,
-                                               gates_perm->nb[0], gates_perm->nb[1], gates_perm->nb[2], 0);
-        
-        ggml_tensor* gated_out = ggml_mul(ctx, attn_out_raw, gates_bcast);
-        
-        ggml_tensor* out_perm = ggml_permute(ctx, gated_out, 0, 2, 1, 3);
-        ggml_tensor* out_cont = ggml_cont(ctx, out_perm);
-        ggml_tensor* out_flat = ggml_reshape_3d(ctx, out_cont, DIM_INNER, T, fb);
+        SetTensorName(gates, "t" + std::to_string(layer) + ".gate.sig");
+
+        ggml_tensor* gates_bcast = ggml_view_4d(ctx, gates, 1, HEADS, T, fb,
+                                               gates->nb[0], gates->nb[1], gates->nb[2], 0);
+        SetTensorName(gates_bcast, "t" + std::to_string(layer) + ".gate.fa");
+        ggml_tensor* gated_out = ggml_mul(ctx, attn_out_fa, gates_bcast);
+        SetTensorName(gated_out, "t" + std::to_string(layer) + ".gate.mul.fa");
+        ggml_tensor* out_flat = ggml_reshape_3d(ctx, gated_out, DIM_INNER, T, fb);
+        SetTensorName(out_flat, "t" + std::to_string(layer) + ".out.flat");
         
         // blk.{l}.time_attn_out.weight
         ggml_tensor* t_attn_out_w = GetWeight(time_prefix + "_out.weight");
@@ -491,6 +573,8 @@ ggml_tensor* BSRoformer::BuildTransformersGraph(
         
         x = ggml_reshape_4d(ctx, x_packed, D, T, F, B);
         x = ggml_permute(ctx, x, 0, 2, 1, 3);
+        // Required before freq reshape: removing this CONT makes ggml_reshape_3d
+        // assert on non-contiguous input in CUDA CTest.
         x = ggml_cont(ctx, x);
         
         // ========== FREQ TRANSFORMER ==========
@@ -512,82 +596,74 @@ ggml_tensor* BSRoformer::BuildTransformersGraph(
         
         ggml_tensor* f_qkv_w = GetWeight(freq_prefix + "_qkv.weight");
         if (!f_qkv_w) { std::cerr << "Missing freq qkv\n"; return nullptr; }
-        
-        ggml_tensor* f_qkv_out = ggml_mul_mat(ctx, f_qkv_w, x_fnorm);
-        
-        ggml_tensor* fQ_view = ggml_view_4d(ctx, f_qkv_out, DIM_HEAD, F, HEADS, tb, 
-                                           f_qkv_out->nb[1], DIM_HEAD*sizeof(float), f_qkv_out->nb[2], 0);
-        ggml_tensor* fK_view = ggml_view_4d(ctx, f_qkv_out, DIM_HEAD, F, HEADS, tb,
-                                           f_qkv_out->nb[1], DIM_HEAD*sizeof(float), f_qkv_out->nb[2], DIM_INNER*sizeof(float));
-        ggml_tensor* fV_view = ggml_view_4d(ctx, f_qkv_out, DIM_HEAD, F, HEADS, tb,
-                                           f_qkv_out->nb[1], DIM_HEAD*sizeof(float), f_qkv_out->nb[2], 2*DIM_INNER*sizeof(float));
-        
-        ggml_tensor* fQ = ggml_cont(ctx, fQ_view);
-        ggml_tensor* fK = ggml_cont(ctx, fK_view);
-        ggml_tensor* fV = ggml_cont(ctx, fV_view);
-        
-        // RoPE with CUDA-compatible reshape for Freq Transformer
-        // fQ/fK shape after permute: [DIM_HEAD, HEADS, F, tb]
-        ggml_tensor* fQ_perm = ggml_permute(ctx, fQ, 0, 2, 1, 3);
-        ggml_tensor* fK_perm = ggml_permute(ctx, fK, 0, 2, 1, 3);
-        ggml_tensor* fQ_perm_cont = ggml_cont(ctx, fQ_perm);
-        ggml_tensor* fK_perm_cont = ggml_cont(ctx, fK_perm);
-        
-        // Reshape to merge batch(tb) into sequence for CUDA RoPE compatibility
+
+        ggml_tensor* fV = nullptr;
+        ggml_tensor* freq_qk_source = nullptr;
+        size_t freq_q_offset = 0;
+        size_t freq_k_offset = static_cast<size_t>(DIM_INNER) * sizeof(float);
+        if (CanSplitQkvWeight(f_qkv_w, DIM_INNER)) {
+            ggml_tensor* f_qk_w = ggml_view_2d(ctx, f_qkv_w, f_qkv_w->ne[0], 2 * DIM_INNER,
+                                               f_qkv_w->nb[1], 0);
+            ggml_tensor* f_v_w = ggml_view_2d(ctx, f_qkv_w, f_qkv_w->ne[0], DIM_INNER,
+                                              f_qkv_w->nb[1],
+                                              static_cast<size_t>(2 * DIM_INNER) * f_qkv_w->nb[1]);
+
+            ggml_tensor* f_qk_out = ggml_mul_mat(ctx, f_qk_w, x_fnorm);
+            ggml_tensor* f_v_out = ggml_mul_mat(ctx, f_v_w, x_fnorm);
+            freq_qk_source = f_qk_out;
+            SetTensorName(f_qk_out, "f" + std::to_string(layer) + ".qk.mm");
+            SetTensorName(f_v_out, "f" + std::to_string(layer) + ".v.mm");
+
+            ggml_tensor* fV_view = ggml_view_4d(ctx, f_v_out, DIM_HEAD, F, HEADS, tb,
+                                               f_v_out->nb[1], DIM_HEAD * sizeof(float), f_v_out->nb[2], 0);
+            fV = fV_view;
+            SetTensorName(fV, "f" + std::to_string(layer) + ".v.fa");
+        } else {
+            LogSplitQkvFallbackOnce("freq attention", f_qkv_w, DIM_INNER);
+            ggml_tensor* f_qkv_out = ggml_mul_mat(ctx, f_qkv_w, x_fnorm);
+            freq_qk_source = f_qkv_out;
+            SetTensorName(f_qkv_out, "f" + std::to_string(layer) + ".qkv.mm");
+
+            ggml_tensor* fV_view = ggml_view_4d(ctx, f_qkv_out, DIM_HEAD, F, HEADS, tb,
+                                               f_qkv_out->nb[1], DIM_HEAD * sizeof(float), f_qkv_out->nb[2],
+                                               2 * DIM_INNER * sizeof(float));
+            fV = ggml_cont(ctx, fV_view);
+            SetTensorName(fV, "f" + std::to_string(layer) + ".v.fa");
+        }
+
         int F_tb = F * tb;
-        ggml_tensor* fQ_flat = ggml_reshape_4d(ctx, fQ_perm_cont, DIM_HEAD, HEADS, F_tb, 1);
-        ggml_tensor* fK_flat = ggml_reshape_4d(ctx, fK_perm_cont, DIM_HEAD, HEADS, F_tb, 1);
-        
-        // Use passed-in expanded position tensor (caller prepares [F*T*B] with repeating [0..F-1])
-        ggml_tensor* fQ_rope_flat = ggml_rope_ext(ctx, fQ_flat, pos_freq_exp, nullptr, DIM_HEAD, 
-                                                  GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        ggml_tensor* fK_rope_flat = ggml_rope_ext(ctx, fK_flat, pos_freq_exp, nullptr, DIM_HEAD,
-                                                  GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        
-        // Reshape back to [DIM_HEAD, HEADS, F, tb]
-        ggml_tensor* fQ_rope_perm = ggml_reshape_4d(ctx, fQ_rope_flat, DIM_HEAD, HEADS, F, tb);
-        ggml_tensor* fK_rope_perm = ggml_reshape_4d(ctx, fK_rope_flat, DIM_HEAD, HEADS, F, tb);
-        
+        ggml_tensor* fQ_flat = ggml_view_4d(ctx, freq_qk_source, DIM_HEAD, HEADS, F_tb, 1,
+                                            DIM_HEAD * sizeof(float), freq_qk_source->nb[1],
+                                            static_cast<size_t>(F_tb) * freq_qk_source->nb[1],
+                                            freq_q_offset);
+        ggml_tensor* fK_flat = ggml_view_4d(ctx, freq_qk_source, DIM_HEAD, HEADS, F_tb, 1,
+                                            DIM_HEAD * sizeof(float), freq_qk_source->nb[1],
+                                            static_cast<size_t>(F_tb) * freq_qk_source->nb[1],
+                                            freq_k_offset);
+        SetTensorName(fQ_flat, "f" + std::to_string(layer) + ".q.rope.in.direct");
+        SetTensorName(fK_flat, "f" + std::to_string(layer) + ".k.rope.in.direct");
+
+        ggml_tensor* fQ_rope_flat = ApplyRopeExtNormalInplace(ctx, fQ_flat, pos_freq_exp, DIM_HEAD);
+        ggml_tensor* fK_rope_flat = ApplyRopeExtNormalInplace(ctx, fK_flat, pos_freq_exp, DIM_HEAD);
+        SetTensorName(fQ_rope_flat, "f" + std::to_string(layer) + ".q.rope.out");
+        SetTensorName(fK_rope_flat, "f" + std::to_string(layer) + ".k.rope.out");
+
+        ggml_tensor* fQ_rope_perm = RestoreDirectRopeFlat(ctx, fQ_rope_flat, DIM_HEAD, HEADS, F, tb);
+        ggml_tensor* fK_rope_perm = RestoreDirectRopeFlat(ctx, fK_rope_flat, DIM_HEAD, HEADS, F, tb);
         ggml_tensor* fQ_rope = ggml_permute(ctx, fQ_rope_perm, 0, 2, 1, 3);
         ggml_tensor* fK_rope = ggml_permute(ctx, fK_rope_perm, 0, 2, 1, 3);
+        SetTensorName(fQ_rope, "f" + std::to_string(layer) + ".q.fa");
+        SetTensorName(fK_rope, "f" + std::to_string(layer) + ".k.fa");
         
         // Flash Attention (Freq)
         // Inputs: [DIM_HEAD, F, HEADS, tb]
-        ggml_tensor* fQ_fa = ggml_cont(ctx, fQ_rope);
-        ggml_tensor* fK_fa = ggml_cont(ctx, fK_rope);
-        ggml_tensor* fV_fa = fV; // fV is contiguous [DIM_HEAD, F, HEADS, tb]
+        ggml_tensor* fQ_fa = fQ_rope;
+        ggml_tensor* fK_fa = fK_rope;
+        ggml_tensor* fV_fa = fV; // [DIM_HEAD, F, HEADS, tb]
 
-        // float scale is already defined in scope (Time Transformer block) or re-define if shadowed loop?
-        // Actually 'scale' was defined inside the Time Transformer loop, so it persists? 
-        // No, Freq Transformer is in the same loop logic? 
-        // Let's check scope. It's in the same 'layer' loop.
-        // But previously I removed the definition line in Time Transformer too? No, I added it back above.
-        // Wait, best to redeclare or rely on scope? 
-        // Time Transformer code block vs Freq Transformer.
-        // Let's just use the value. 
-        // Re-reading Freq Block:
-        // Need to be safe. Redefine 'scale' if needed or ensuring it's available.
-        // Previous search showed `float scale` was defined in Time Block.
-        // If Time block is just sequential code, `scale` is available.
-        // But I removed the line in Time block in the previous step (lines 307-319 replaced).
-        // So I need to add it back in Time block (done in chunk 1).
-        // For Freq block, if it's in same scope, it's fine.
-        // However, standard good practice:
-        
-        // float scale = 1.0f / sqrtf(static_cast<float>(DIM_HEAD)); // Redefinition might error if same scope.
-        // Let's check file content to see if Freq block is separately scoped.
-        // It's in `for (int layer...) { ... Time ... Freq ... }`.
-        // So `scale` defined in Time part is visible in Freq part.
-        // So I don't need to define it again, just ensure it IS defined in Time part.
-        
         ggml_tensor* f_attn_out_fa = ggml_flash_attn_ext(ctx, fQ_fa, fK_fa, fV_fa, nullptr, scale, 0.0f, 0.0f);
+        SetTensorName(f_attn_out_fa, "f" + std::to_string(layer) + ".fa.out");
 
-        // Permute output back to [DIM_HEAD, F, HEADS, tb]
-        ggml_tensor* f_attn_out_perm = ggml_permute(ctx, f_attn_out_fa, 0, 2, 1, 3);
-        ggml_tensor* f_attn_out_raw = ggml_cont(ctx, f_attn_out_perm);
-        
-
-        
         ggml_tensor* f_gate_w = GetWeight(freq_prefix + "_gate.weight");
         ggml_tensor* f_gate_b = GetWeight(freq_prefix + "_gate.bias");
         if (!f_gate_w || !f_gate_b) { std::cerr << "Missing freq gates\n"; return nullptr; }
@@ -595,16 +671,15 @@ ggml_tensor* BSRoformer::BuildTransformersGraph(
         ggml_tensor* f_gates = ggml_mul_mat(ctx, f_gate_w, x_fnorm);
         f_gates = ggml_add(ctx, f_gates, f_gate_b);
         f_gates = ggml_sigmoid(ctx, f_gates);
-        
-        ggml_tensor* f_gates_perm = ggml_permute(ctx, f_gates, 1, 0, 2, 3);
-        ggml_tensor* f_gates_bcast = ggml_view_4d(ctx, f_gates_perm, 1, F, HEADS, tb,
-                                                  f_gates_perm->nb[0], f_gates_perm->nb[1], f_gates_perm->nb[2], 0);
-        
-        ggml_tensor* f_gated_out = ggml_mul(ctx, f_attn_out_raw, f_gates_bcast);
-        
-        ggml_tensor* f_out_perm = ggml_permute(ctx, f_gated_out, 0, 2, 1, 3);
-        ggml_tensor* f_out_cont = ggml_cont(ctx, f_out_perm);
-        ggml_tensor* f_out_flat = ggml_reshape_3d(ctx, f_out_cont, DIM_INNER, F, tb);
+        SetTensorName(f_gates, "f" + std::to_string(layer) + ".gate.sig");
+
+        ggml_tensor* f_gates_bcast = ggml_view_4d(ctx, f_gates, 1, HEADS, F, tb,
+                                                  f_gates->nb[0], f_gates->nb[1], f_gates->nb[2], 0);
+        SetTensorName(f_gates_bcast, "f" + std::to_string(layer) + ".gate.fa");
+        ggml_tensor* f_gated_out = ggml_mul(ctx, f_attn_out_fa, f_gates_bcast);
+        SetTensorName(f_gated_out, "f" + std::to_string(layer) + ".gate.mul.fa");
+        ggml_tensor* f_out_flat = ggml_reshape_3d(ctx, f_gated_out, DIM_INNER, F, tb);
+        SetTensorName(f_out_flat, "f" + std::to_string(layer) + ".out.flat");
         
 
         
@@ -709,14 +784,12 @@ ggml_tensor* BSRoformer::BuildMaskEstimatorGraph(
     
     ggml_tensor* x = input;  // [D, F, T, B]
     
-    // Create mask_output tensor: [total_out_dim, num_stems, n_frames, batch]
-    ggml_tensor* mask_output = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, total_out_dim, NUM_STEMS, n_frames, batch);
-    // No set_input needed if we cpy into it? Actually we construct it piecewise.
-    // Making it zero-initialized or using views to write into it is safer.
-    // ggml_set_zero(mask_output); // Not available easily in graph building usually, assumes overwritten.
+    std::vector<ggml_tensor*> stem_outputs;
+    stem_outputs.reserve(NUM_STEMS);
     
     for (int s = 0; s < NUM_STEMS; ++s) {
-        size_t mask_offset_elements = 0;
+        std::vector<ggml_tensor*> band_outputs;
+        band_outputs.reserve(NUM_BANDS);
         
         for (int b = 0; b < NUM_BANDS; ++b) {
             // Extract band input: [DIM, n_frames, batch] for this band
@@ -767,36 +840,30 @@ ggml_tensor* BSRoformer::BuildMaskEstimatorGraph(
                                               dim_out, n_frames, batch,
                                               mlp_current->nb[1], mlp_current->nb[2],
                                               dim_out * sizeof(float));
-            
-            glu_a = ggml_cont(ctx, glu_a);
+            SetTensorName(glu_a, "mask.glu.a");
+            SetTensorName(glu_b, "mask.glu.b");
+
+            // Rejected: splitting the final GLU projection into separate A/B matmuls removed
+            // this CONT, but changed the q8 CUDA output hash and increased nodes/latency
+            // (2104->2290 nodes, 3.713s->3.762s on test_segment.wav).
             glu_b = ggml_cont(ctx, glu_b);
+            SetTensorName(glu_b, "mask.glu.b.sig.cont");
             
             ggml_tensor* glu_b_sig = ggml_sigmoid(ctx, glu_b);
             ggml_tensor* band_out = ggml_mul(ctx, glu_a, glu_b_sig);
+            SetTensorName(glu_b_sig, "mask.glu.b.sig");
+            SetTensorName(band_out, "mask.glu.mul");
             
-            // Copy to mask_output
-            // Destination slice: mask_output[offset:offset+dim, s, :, :]
-            // Use view_4d
-            // offset in dimension 0 is mask_offset_elements
-            // offset in dimension 1 is s
-            size_t dest_offset_bytes = (mask_offset_elements * sizeof(float)) + (s * mask_output->nb[1]);
-            
-            ggml_tensor* dst_view = ggml_view_3d(ctx, mask_output,
-                                                 dim_out, n_frames, batch,
-                                                 mask_output->nb[2], // Time stride
-                                                 mask_output->nb[3], // Batch stride
-                                                 dest_offset_bytes); // Offset to correct freq-bin and stem
-                                                 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, band_out, dst_view));
-            
-            mask_offset_elements += dim_out;
+            ggml_tensor* band_out_4d = ggml_reshape_4d(ctx, band_out, dim_out, 1, n_frames, batch);
+            band_outputs.push_back(band_out_4d);
         }
+
+        ggml_tensor* stem_output = ConcatBalanced(ctx, band_outputs, 0);
+        stem_outputs.push_back(stem_output);
     }
-    
-    // Ensure output
-    ggml_tensor* mask_check = ggml_dup(ctx, mask_output);
-    ggml_set_output(mask_check);
-    ggml_build_forward_expand(gf, mask_check);
-    
-    return mask_check;
+
+    ggml_tensor* mask_output = ConcatBalanced(ctx, stem_outputs, 1);
+    ggml_set_output(mask_output);
+    ggml_build_forward_expand(gf, mask_output);
+    return mask_output;
 }

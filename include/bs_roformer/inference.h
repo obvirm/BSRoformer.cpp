@@ -4,11 +4,16 @@
 #include <string>
 #include <memory>
 #include <functional>
+#include <unordered_map>
+#include <cstddef>
+#include <cstdint>
 // Forward declaration
 class BSRoformer;
 
-// Forward declaration
-namespace ggml { struct context; struct cgraph; }
+struct ggml_context;
+struct ggml_cgraph;
+struct ggml_gallocr;
+struct ggml_tensor;
 
 class Inference {
 public:
@@ -56,24 +61,24 @@ private:
 
 private:
     std::unique_ptr<BSRoformer> model_;
-    
-    // Persistent Graph State
-    struct ggml_context* ctx_ = nullptr;
-    struct ggml_cgraph* gf_ = nullptr;
-    struct ggml_gallocr* allocr_ = nullptr;
-    
-    // Cached Input Tensors (owned by ctx_)
-    struct ggml_tensor* input_tensor_ = nullptr;
-    struct ggml_tensor* pos_time_ = nullptr;
-    struct ggml_tensor* pos_freq_ = nullptr;
-    struct ggml_tensor* mask_out_tensor_ = nullptr;
+    struct CpuScratch;
 
-    // Cached Host Data (to avoid reallocation)
-    std::vector<int32_t> pos_time_data_;
-    std::vector<int32_t> pos_freq_data_;
+    struct GraphState {
+        int n_frames = -1;
+        ggml_context* ctx = nullptr;
+        ggml_cgraph* gf = nullptr;
+        ggml_gallocr* allocr = nullptr;
+        ggml_tensor* input_tensor = nullptr;
+        ggml_tensor* pos_time = nullptr;
+        ggml_tensor* pos_freq = nullptr;
+        ggml_tensor* mask_out_tensor = nullptr;
+        std::vector<int32_t> pos_time_data;
+        std::vector<int32_t> pos_freq_data;
+        size_t compute_buffer_size = 0;
+        int graph_nodes = 0;
+    };
 
-    // Current config state
-    int cached_n_frames_ = -1;
+    std::unordered_map<int, std::unique_ptr<GraphState>> graph_cache_;
 
     // Pipelined State Data
     struct ChunkState {
@@ -88,11 +93,14 @@ private:
     };
 
     // Helper to ensure graph is built for specific n_frames
-    bool EnsureGraph(int n_frames);
+    GraphState* EnsureGraph(int n_frames);
+    void ReleaseGraphState(GraphState& graph);
+    void ClearGraphCache();
 
     void ComputeSTFT(const std::vector<float>& input_audio,
                      std::vector<std::vector<float>>& stft_outputs,
-                     int& n_frames);
+                     int& n_frames,
+                     CpuScratch& scratch);
                      
     void PrepareModelInput(const std::vector<std::vector<float>>& stft_outputs,
                            int n_frames,
@@ -101,10 +109,11 @@ private:
     void PostProcessAndISTFT(const std::vector<float>& mask_output,
                              const std::vector<std::vector<float>>& stft_outputs,
                              int n_frames,
-                             std::vector<std::vector<float>>& output_audio);
+                             std::vector<std::vector<float>>& output_audio,
+                             CpuScratch& scratch);
 
     // Pipeline Steps
-    std::shared_ptr<ChunkState> PreProcessChunk(const std::vector<float>& chunk_audio, int id);
+    std::shared_ptr<ChunkState> PreProcessChunk(const std::vector<float>& chunk_audio, int id, CpuScratch& scratch);
     void RunInference(std::shared_ptr<ChunkState> state);
-    void PostProcessChunk(std::shared_ptr<ChunkState> state);
+    void PostProcessChunk(std::shared_ptr<ChunkState> state, CpuScratch& scratch);
 };

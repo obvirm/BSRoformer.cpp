@@ -62,6 +62,20 @@
 
 ---
 
+## 后端质量与性能说明
+
+后端可用性由 ggml 构建配置决定。程序初始化 ggml 默认的最佳后端，不再暴露通用的项目级后端选择器。为兼容已有下游集成，仍保留 `BSR_FORCE_CPU=1` 作为 CPU-only 覆盖开关。
+
+Vulkan 默认不禁用 `NV_coopmat2`，因为 q8/fp16 模型是更常见的用户性能路径。需要保守数值验证或排查问题时，可设置：
+
+```bash
+GGML_VK_DISABLE_COOPMAT2=1
+```
+
+FP32 golden 测试主要用于诊断图构建和后端正确性，不代表普通用户 q8/fp16 推理的默认性能目标。
+
+---
+
 ## 🔧 从源码构建
 
 ### 前置条件
@@ -288,6 +302,15 @@ ctest --test-dir build -C Release
 # 运行特定测试
 ctest --test-dir build -C Release -R test_inference
 ```
+
+Vulkan 正确性测试建议使用 ggml 的保守路径：
+
+```powershell
+$env:GGML_VK_DISABLE_COOPMAT2 = "1"
+ctest --test-dir build -C Release --output-on-failure
+```
+
+CLI wall-time 基准工具位于 `scripts/benchmark.ps1`，最终 WAV 对比工具位于 `scripts/compare_wav.py`。
 
 ### 测试套件
 

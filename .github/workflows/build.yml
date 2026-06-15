@@ -8,6 +8,7 @@ on:
       - '**/*.h'
       - '**/*.hpp'
       - '**/CMakeLists.txt'
+      - 'scripts/**'
       - '.github/workflows/**'
   pull_request:
     types: [opened, synchronize, reopened]
@@ -191,7 +192,7 @@ jobs:
       - name: Install Vulkan SDK (Linux)
         if: matrix.backend == 'vulkan' && runner.os == 'Linux'
         run: |
-          sudo apt-get install -y libvulkan-dev glslc mesa-vulkan-drivers
+          sudo apt-get install -y libvulkan-dev glslc mesa-vulkan-drivers vulkan-tools
           
       # ----- macOS Dependencies -----  
       - name: Install Dependencies (macOS)
@@ -221,6 +222,7 @@ jobs:
             -DGGML_DIR=ggml \
             -DGGML_CUDA=OFF \
             -DGGML_VULKAN=${{ matrix.backend == 'vulkan' && 'ON' || 'OFF' }} \
+            -DGGML_METAL=${{ runner.os == 'macOS' && 'ON' || 'OFF' }} \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DBSR_BUILD_TESTS=ON \
@@ -233,6 +235,7 @@ jobs:
             -DGGML_DIR=ggml `
             -DGGML_CUDA=OFF `
             -DGGML_VULKAN=${{ matrix.backend == 'vulkan' && 'ON' || 'OFF' }} `
+            -DGGML_METAL=OFF `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
             -DBSR_BUILD_TESTS=ON `
@@ -246,31 +249,50 @@ jobs:
       - name: Build (Windows)
         if: runner.os == 'Windows'
         run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Decide Runtime Tests
+        if: matrix.test
+        shell: bash
+        run: |
+          if [[ "${{ matrix.backend }}" != "vulkan" ]]; then
+            echo "BSR_RUNTIME_TESTS=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/dev/null 2>&1; then
+            echo "BSR_RUNTIME_TESTS=true" >> "$GITHUB_ENV"
+          else
+            echo "No Vulkan runtime device detected; skipping runtime tests for this Vulkan job."
+            echo "BSR_RUNTIME_TESTS=false" >> "$GITHUB_ENV"
+          fi
         
       # ----- Unit Tests -----
       - name: Run Unit Tests
-        if: matrix.test
+        if: matrix.test && env.BSR_RUNTIME_TESTS == 'true'
         env:
           BSR_MODEL_PATH: ${{ github.workspace }}/model.gguf
           BSR_TEST_DATA_DIR: ${{ github.workspace }}/test_data
           BSR_FORCE_CPU: ${{ runner.os == 'macOS' && '1' || '' }}
+          GGML_VK_DISABLE_COOPMAT2: ${{ matrix.backend == 'vulkan' && '1' || '' }}
         run: ctest --test-dir build -C Release -V --output-on-failure --timeout 300
         
       - name: Run Unit Tests (BS Roformer)
-        if: matrix.test
+        if: matrix.test && env.BSR_RUNTIME_TESTS == 'true'
         env:
           BSR_MODEL_PATH: ${{ github.workspace }}/model_bs.gguf
           BSR_TEST_DATA_DIR: ${{ github.workspace }}/test_data_bs
           BSR_FORCE_CPU: ${{ runner.os == 'macOS' && '1' || '' }}
+          GGML_VK_DISABLE_COOPMAT2: ${{ matrix.backend == 'vulkan' && '1' || '' }}
         run: ctest --test-dir build -C Release -V --output-on-failure --timeout 300
         
       # ----- CLI Tests -----
       - name: Test CLI
-        if: matrix.test
+        if: matrix.test && env.BSR_RUNTIME_TESTS == 'true'
         shell: bash
         env:
           BSR_MODEL_PATH: ${{ github.workspace }}/model.gguf
           BSR_FORCE_CPU: ${{ runner.os == 'macOS' && '1' || '' }}
+          GGML_VK_DISABLE_COOPMAT2: ${{ matrix.backend == 'vulkan' && '1' || '' }}
         run: |
           echo "=== CLI Test Suite ==="
           

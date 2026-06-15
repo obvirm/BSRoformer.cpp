@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #ifdef USE_OPENMP
 #include <omp.h>
@@ -79,17 +80,19 @@ inline void hann_window(float* out, int size, bool periodic = true) {
 
 class TableFFT {
 public:
-    static TableFFT& GetInstance(int n_fft) {
+    static std::shared_ptr<const TableFFT> GetInstance(int n_fft) {
         static std::mutex mtx;
-        static std::unique_ptr<TableFFT> instance;
-        static int current_n_fft = -1;
+        static std::unordered_map<int, std::shared_ptr<const TableFFT>> cache;
 
         std::lock_guard<std::mutex> lock(mtx);
-        if (!instance || current_n_fft != n_fft) {
-            instance = std::make_unique<TableFFT>(n_fft);
-            current_n_fft = n_fft;
+        auto cached = cache.find(n_fft);
+        if (cached != cache.end()) {
+            return cached->second;
         }
-        return *instance;
+
+        std::shared_ptr<const TableFFT> instance = std::make_shared<TableFFT>(n_fft);
+        cache.emplace(n_fft, instance);
+        return instance;
     }
 
     TableFFT(int n) : n_(n) {
@@ -183,14 +186,17 @@ private:
 // STFT Wrapper (Optimized)
 //=============================================================================
 
-inline void rfft(const float* input, Complex* output, int n, STFTBuffer& buffer) {
+// Rejected: reusing STFT/ISTFT internal scratch across calls triggered a
+// post-PASSED 0xc0000409 stack-protection failure in CUDA test_inference.
+// Keep these internal buffers function-local.
+inline void rfft(const float* input, Complex* output, int n, STFTBuffer& buffer, const TableFFT& fft) {
     // 1. Copy to complex buffer
     for (int i = 0; i < n; ++i) {
         buffer.fft_scratch[i] = Complex(input[i], 0.0f);
     }
     
     // 2. FFT
-    TableFFT::GetInstance(n).Forward(buffer.fft_scratch.data());
+    fft.Forward(buffer.fft_scratch.data());
     
     // 3. Copy first N/2 + 1
     int n_out = n / 2 + 1;
@@ -199,7 +205,7 @@ inline void rfft(const float* input, Complex* output, int n, STFTBuffer& buffer)
     }
 }
 
-inline void irfft(const Complex* input, float* output, int n_out, STFTBuffer& buffer) {
+inline void irfft(const Complex* input, float* output, int n_out, STFTBuffer& buffer, const TableFFT& fft) {
     int n_freq = n_out / 2 + 1;
     
     // 1. Reconstruct full spectrum
@@ -211,7 +217,7 @@ inline void irfft(const Complex* input, float* output, int n_out, STFTBuffer& bu
     }
     
     // 2. IFFT
-    TableFFT::GetInstance(n_out).Inverse(buffer.fft_scratch.data());
+    fft.Inverse(buffer.fft_scratch.data());
     
     // 3. Real part
     for (int i = 0; i < n_out; ++i) {
@@ -240,16 +246,7 @@ inline void compute_stft(
     if (n_frames < 0) n_frames = 0;
     *n_frames_out = n_frames;
     
-    // Prepare padding buffer (thread-local or single allocation if not parallel? 
-    // Padding + Windowing is usually fast, but padding needs full copy.)
-    // For safety and simplicity, let's allocate padded audio once here (It's one large buffer).
-    // The previous implementation used thread_local for 'padded_audio' which is wrong because 
-    // 'padded_audio' needs to hold the WHOLE signal? No, stft.h:52 says 'padded_audio'.
-    // Analyzing original code: It copied the WHOLE signal to 'padded_audio' inside compute_stft.
-    // That means 'tls_buffer' was huge! If we have multiple threads, each copying full audio? 
-    // That's wasteful.
-    // Better: Allocate 'padded' once on heap.
-    
+    // Rejected: thread-local padded audio duplicated full inputs per worker and raised memory use.
     std::vector<float> padded(padded_len);
     if (center) {
         // Reflect padding
@@ -271,6 +268,7 @@ inline void compute_stft(
     }
 
     int n_freq = n_fft / 2 + 1;
+    std::shared_ptr<const TableFFT> fft = TableFFT::GetInstance(n_fft);
     
     // Prepare window (Single copy)
     std::vector<float> window_padded(n_fft, 0.0f);
@@ -311,7 +309,7 @@ inline void compute_stft(
         // Output pointer directly to destination
         // We need a place to store complex output before writing to planar output
         
-        rfft(frame.data(), buffer.fft_out.data(), n_fft, buffer);
+        rfft(frame.data(), buffer.fft_out.data(), n_fft, buffer, *fft);
         
         // Write to output
         for (int k = 0; k < n_freq; ++k) {
@@ -348,6 +346,7 @@ inline void compute_istft(
     }
     
     // Prepare thread buffers
+    std::shared_ptr<const TableFFT> fft = TableFFT::GetInstance(n_fft);
     int max_threads = 1;
     #ifdef USE_OPENMP
     max_threads = omp_get_max_threads();
@@ -379,7 +378,7 @@ inline void compute_istft(
         }
         
         // IFFT
-        irfft(fft_in.data(), frame_out.data(), n_fft, buffer);
+        irfft(fft_in.data(), frame_out.data(), n_fft, buffer, *fft);
         
         // Store
         std::memcpy(&frames_time_domain[f * n_fft], frame_out.data(), n_fft * sizeof(float));

@@ -77,9 +77,12 @@ int main(int argc, char** argv) {
             std::cout << std::endl;
             
             int n_frames_calc = 0;
-            // Buffer for output. 
-            // C++ output is [n_freq, n_frames, 2]
-            std::vector<float> out_stft(n_freq * (expected_n_frames + 10) * 2); 
+            // Buffer for output. C++ output is [n_freq, n_frames, 2].
+            // Allocate for the model-derived frame count too, so mismatched
+            // model/test-data STFT params fail cleanly instead of overflowing.
+            int max_calc_frames = n_samples / hop_length + 5;
+            int out_frames_capacity = std::max(expected_n_frames + 10, max_calc_frames);
+            std::vector<float> out_stft(n_freq * out_frames_capacity * 2);
             
             stft::compute_stft(
                 in_channel.data(), n_samples, n_fft, hop_length, win_length,

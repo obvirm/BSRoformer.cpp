@@ -9,17 +9,41 @@
 #include <ggml.h>
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
-#include <chrono>
-#include <future>
 #include <queue>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
 #include <exception>
+#include <stdexcept>
 
 using Complex = std::complex<float>;
 static constexpr const char* kInferenceCancelledMessage = "Inference cancelled";
+
+namespace {
+constexpr size_t kGraphContextSize = 1024ull * 1024 * 1024;
+constexpr int kGraphCapacity = 65536;
+}
+
+struct Inference::CpuScratch {
+    // Rejected: sharing one Inference-wide scratch across the pipeline caused
+    // cross-thread vector reuse and a post-PASSED 0xc0000409 test_inference crash.
+    // Keep scratch ownership local to each serial call or pipeline stage thread.
+    int hann_win_length = -1;
+    std::vector<float> hann_window;
+    std::vector<float> channel_audio;
+    std::vector<float> istft_in;
+    std::vector<std::vector<float>> output_channels;
+
+    void EnsureHannWindow(int win_length) {
+        if (hann_win_length == win_length && hann_window.size() == static_cast<size_t>(win_length)) {
+            return;
+        }
+        hann_window.resize(win_length);
+        stft::hann_window(hann_window.data(), win_length);
+        hann_win_length = win_length;
+    }
+};
 
 // Helper forward decl
 std::vector<float> GetWindow(int size, int fade_size);
@@ -62,84 +86,132 @@ int Inference::GetNumStems() const {
 }
 
 Inference::~Inference() {
-    if (allocr_) ggml_gallocr_free(allocr_);
-    if (ctx_) ggml_free(ctx_);
-    // gf_ is part of ctx_, tensor pointers are part of ctx_
+    ClearGraphCache();
 }
 
-bool Inference::EnsureGraph(int n_frames) {
-    if (n_frames == cached_n_frames_ && ctx_ != nullptr) {
-        return true;
+void Inference::ReleaseGraphState(GraphState& graph) {
+    if (graph.allocr) {
+        ggml_gallocr_free(graph.allocr);
+        graph.allocr = nullptr;
     }
-    
+    if (graph.ctx) {
+        ggml_free(graph.ctx);
+        graph.ctx = nullptr;
+    }
+    graph.gf = nullptr;
+    graph.input_tensor = nullptr;
+    graph.pos_time = nullptr;
+    graph.pos_freq = nullptr;
+    graph.mask_out_tensor = nullptr;
+}
+
+void Inference::ClearGraphCache() {
+    for (auto& entry : graph_cache_) {
+        ReleaseGraphState(*entry.second);
+    }
+    graph_cache_.clear();
+}
+
+Inference::GraphState* Inference::EnsureGraph(int n_frames) {
+    auto cached = graph_cache_.find(n_frames);
+    if (cached != graph_cache_.end()) {
+        return cached->second.get();
+    }
+
+    if (!graph_cache_.empty()) {
+        ClearGraphCache();
+    }
+
     std::cout << "[Inference] Building graph for n_frames=" << n_frames << std::endl;
 
-    // Cleanup old graph
-    if (allocr_) { ggml_gallocr_free(allocr_); allocr_ = nullptr; }
-    if (ctx_) { ggml_free(ctx_); ctx_ = nullptr; }
-    
-    cached_n_frames_ = n_frames;
+    auto graph = std::make_unique<GraphState>();
+    graph->n_frames = n_frames;
 
-    // Allocate context
-    size_t mem_size = 1024ull * 1024 * 1024; // 1GB
-    struct ggml_init_params ctx_params = { mem_size, nullptr, true };
-    ctx_ = ggml_init(ctx_params);
-    if (!ctx_) return false;
+    struct ggml_init_params ctx_params = { kGraphContextSize, nullptr, true };
+    graph->ctx = ggml_init(ctx_params);
+    if (!graph->ctx) return nullptr;
     
-    gf_ = ggml_new_graph_custom(ctx_, 65536, false);
+    graph->gf = ggml_new_graph_custom(graph->ctx, kGraphCapacity, false);
 
     int batch = 1;
     int total_dim_input = model_->GetTotalDimInput();
     
-    input_tensor_ = ggml_new_tensor_3d(ctx_, GGML_TYPE_F32, total_dim_input, n_frames, batch);
-    ggml_set_input(input_tensor_);
+    graph->input_tensor = ggml_new_tensor_3d(graph->ctx, GGML_TYPE_F32, total_dim_input, n_frames, batch);
+    ggml_set_name(graph->input_tensor, "in.model");
+    ggml_set_input(graph->input_tensor);
 
     // BandSplit -> Transformers -> MaskEstimator
-    ggml_tensor* band_out = model_->BuildBandSplitGraph(ctx_, input_tensor_, gf_, n_frames, batch);
-    
-    int n_bands = model_->GetNumBands();
-    pos_time_ = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_frames * n_bands);
-    pos_freq_ = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, n_bands * n_frames);
-    ggml_set_input(pos_time_);
-    ggml_set_input(pos_freq_);
-
-    ggml_tensor* trans_out = model_->BuildTransformersGraph(ctx_, band_out, gf_, pos_time_, pos_freq_, n_frames, batch);
-    mask_out_tensor_ = model_->BuildMaskEstimatorGraph(ctx_, trans_out, gf_, n_frames, batch);
-
-    // Allocate compute buffer (VRAM)
-    allocr_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model_->GetBackend()));
-    if (!ggml_gallocr_alloc_graph(allocr_, gf_)) {
-        std::cerr << "[Inference] Failed to allocate graph VRAM" << std::endl;
-        return false;
+    ggml_tensor* band_out = model_->BuildBandSplitGraph(graph->ctx, graph->input_tensor, graph->gf, n_frames, batch);
+    if (!band_out) {
+        ReleaseGraphState(*graph);
+        return nullptr;
     }
     
-    return true;
+    int n_bands = model_->GetNumBands();
+    graph->pos_time = ggml_new_tensor_1d(graph->ctx, GGML_TYPE_I32, n_frames * n_bands);
+    graph->pos_freq = ggml_new_tensor_1d(graph->ctx, GGML_TYPE_I32, n_bands * n_frames);
+    ggml_set_name(graph->pos_time, "pos.time");
+    ggml_set_name(graph->pos_freq, "pos.freq");
+    ggml_set_input(graph->pos_time);
+    ggml_set_input(graph->pos_freq);
+
+    ggml_tensor* trans_out = model_->BuildTransformersGraph(graph->ctx, band_out, graph->gf, graph->pos_time, graph->pos_freq, n_frames, batch);
+    if (!trans_out) {
+        ReleaseGraphState(*graph);
+        return nullptr;
+    }
+    graph->mask_out_tensor = model_->BuildMaskEstimatorGraph(graph->ctx, trans_out, graph->gf, n_frames, batch);
+    if (!graph->mask_out_tensor) {
+        ReleaseGraphState(*graph);
+        return nullptr;
+    }
+    // Allocate compute buffer (VRAM)
+    graph->allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model_->GetBackend()));
+    if (!ggml_gallocr_reserve(graph->allocr, graph->gf)) {
+        std::cerr << "[Inference] Warning: failed to reserve graph VRAM; trying direct graph allocation" << std::endl;
+    }
+    if (!ggml_gallocr_alloc_graph(graph->allocr, graph->gf)) {
+        std::cerr << "[Inference] Failed to allocate graph VRAM" << std::endl;
+        ReleaseGraphState(*graph);
+        return nullptr;
+    }
+
+    graph->graph_nodes = ggml_graph_n_nodes(graph->gf);
+    graph->compute_buffer_size = ggml_gallocr_get_buffer_size(graph->allocr, 0);
+    std::cout << "[Inference] Graph ready: n_frames=" << n_frames
+              << ", nodes=" << graph->graph_nodes
+              << ", compute_buffer=" << (graph->compute_buffer_size / (1024.0 * 1024.0)) << " MiB"
+              << std::endl;
+    
+    GraphState* graph_ptr = graph.get();
+    graph_cache_.emplace(n_frames, std::move(graph));
+    return graph_ptr;
 }
 
 void Inference::ComputeSTFT(const std::vector<float>& input_audio,
                             std::vector<std::vector<float>>& stft_outputs,
-                            int& n_frames) {
+                            int& n_frames,
+                            CpuScratch& scratch) {
     int n_fft = model_->GetNFFT();
     int hop_length = model_->GetHopLength();
     int win_length = model_->GetWinLength();
     int n_freq = n_fft / 2 + 1;
     int channels = 2; 
 
-    std::vector<float> window(win_length);
-    stft::hann_window(window.data(), win_length);
+    scratch.EnsureHannWindow(win_length);
 
     stft_outputs.resize(channels);
     int n_samples = input_audio.size() / channels;
 
     for (int ch = 0; ch < channels; ++ch) {
-        std::vector<float> channel_audio(n_samples);
+        scratch.channel_audio.resize(n_samples);
         for (int i = 0; i < n_samples; ++i) {
-            channel_audio[i] = input_audio[ch + i * channels];
+            scratch.channel_audio[i] = input_audio[ch + i * channels];
         }
 
         stft_outputs[ch].resize(n_freq * (n_samples / hop_length + 5) * 2);
-        stft::compute_stft(channel_audio.data(), n_samples, n_fft, hop_length, win_length, 
-                           window.data(), true, stft_outputs[ch].data(), &n_frames);
+        stft::compute_stft(scratch.channel_audio.data(), n_samples, n_fft, hop_length, win_length,
+                           scratch.hann_window.data(), true, stft_outputs[ch].data(), &n_frames);
     }
 }
 
@@ -174,7 +246,8 @@ void Inference::PrepareModelInput(const std::vector<std::vector<float>>& stft_ou
 void Inference::PostProcessAndISTFT(const std::vector<float>& mask_output,
                                     const std::vector<std::vector<float>>& stft_outputs,
                                     int n_frames,
-                                    std::vector<std::vector<float>>& output_audio) {
+                                    std::vector<std::vector<float>>& output_audio,
+                                    CpuScratch& scratch) {
     int n_fft = model_->GetNFFT();
     int hop_length = model_->GetHopLength();
     int win_length = model_->GetWinLength();
@@ -191,81 +264,56 @@ void Inference::PostProcessAndISTFT(const std::vector<float>& mask_output,
     
     output_audio.resize(num_stems);
 
-    std::vector<float> window(win_length);
-    stft::hann_window(window.data(), win_length);
+    scratch.EnsureHannWindow(win_length);
+    scratch.output_channels.resize(channels);
     
+    const std::vector<int>& num_bands_per_freq = model_->GetNumBandsPerFreq();
+    const int istft_input_size = n_freq * n_frames * 2;
+    const int approx_len = (n_frames - 1) * hop_length + n_fft;
+
     // Process each stem
     for (int stem = 0; stem < num_stems; ++stem) {
-        std::vector<Complex> masks(num_freq_indices * n_frames);
-        
-        #ifdef USE_OPENMP
-        #pragma omp parallel for
-        #endif
-        for (int t = 0; t < n_frames; ++t) {
-            // Base index for this frame and current stem
-            int frame_offset = t * stride_time;
-            int stem_offset = stem * mask_features;
-            int base_offset = frame_offset + stem_offset;
-            
-            for (int f = 0; f < num_freq_indices; ++f) {
-                int idx = base_offset + f * 2;
-                masks[f * n_frames + t] = Complex(mask_output[idx + 0], mask_output[idx + 1]);
-            }
-        }
-
-        int total_freq_stereo = n_freq * channels;
-        std::vector<Complex> masks_summed(total_freq_stereo * n_frames, {0.0f, 0.0f});
-
-        for (int f = 0; f < num_freq_indices; ++f) {
-            int dst_idx_base = freq_indices[f]; 
-            for (int t = 0; t < n_frames; ++t) {
-                masks_summed[dst_idx_base * n_frames + t] += masks[f * n_frames + t];
-            }
-        }
-
-        const std::vector<int>& num_bands_per_freq = model_->GetNumBandsPerFreq();
-        #ifdef USE_OPENMP
-        #pragma omp parallel for
-        #endif
-        for (int f = 0; f < n_freq; ++f) {
-            float denom = (float)num_bands_per_freq[f];
-            if (denom < 1e-8f) denom = 1e-8f;
-            for (int ch = 0; ch < channels; ++ch) {
-                int freq_stereo_idx = f * channels + ch;
-                for (int t = 0; t < n_frames; ++t) {
-                    masks_summed[freq_stereo_idx * n_frames + t] /= denom;
-                }
-            }
-        }
-
-        std::vector<Complex> stft_output_masked(total_freq_stereo * n_frames);
-        #ifdef USE_OPENMP
-        #pragma omp parallel for
-        #endif
-        for (int ch = 0; ch < channels; ++ch) {
-            for (int f = 0; f < n_freq; ++f) {
-                int freq_stereo_idx = f * channels + ch;
-                for (int t = 0; t < n_frames; ++t) {
-                    int mask_idx = freq_stereo_idx * n_frames + t;
-                    int stft_idx = (f * n_frames + t) * 2;
-                    Complex stft_val(stft_outputs[ch][stft_idx + 0], stft_outputs[ch][stft_idx + 1]);
-                    stft_output_masked[mask_idx] = stft_val * masks_summed[mask_idx];
-                }
-            }
-        }
-
-        std::vector<std::vector<float>> output_channels(channels);
         int n_samples_out = 0;
 
         for (int ch = 0; ch < channels; ++ch) {
-            std::vector<float> istft_in(n_freq * n_frames * 2);
-            for (int f = 0; f < n_freq; ++f) {
-                int freq_stereo_idx = f * channels + ch;
+            scratch.istft_in.resize(istft_input_size);
+            std::fill(scratch.istft_in.begin(), scratch.istft_in.end(), 0.0f);
+
+            // Rejected: directly combining mask scatter, normalization, and complex
+            // multiply changed output numerics and triggered a test_inference stack
+            // protection failure. Keep the original two-pass math order.
+            for (int f = 0; f < num_freq_indices; ++f) {
+                int freq_stereo_idx = freq_indices[f];
+                if (freq_stereo_idx % channels != ch) {
+                    continue;
+                }
+                int raw_freq_idx = freq_stereo_idx / channels;
+                int dst_base = raw_freq_idx * n_frames * 2;
+
                 for (int t = 0; t < n_frames; ++t) {
-                    int mask_idx = freq_stereo_idx * n_frames + t;
+                    int mask_idx = t * stride_time + stem * mask_features + f * 2;
+                    int dst_idx = dst_base + t * 2;
+                    scratch.istft_in[dst_idx + 0] += mask_output[mask_idx + 0];
+                    scratch.istft_in[dst_idx + 1] += mask_output[mask_idx + 1];
+                }
+            }
+
+            #ifdef USE_OPENMP
+            #pragma omp parallel for
+            #endif
+            for (int f = 0; f < n_freq; ++f) {
+                float denom = (float)num_bands_per_freq[f];
+                if (denom < 1e-8f) denom = 1e-8f;
+
+                for (int t = 0; t < n_frames; ++t) {
                     int dst_idx = (f * n_frames + t) * 2;
-                    istft_in[dst_idx + 0] = stft_output_masked[mask_idx].real();
-                    istft_in[dst_idx + 1] = stft_output_masked[mask_idx].imag();
+                    int stft_idx = dst_idx;
+                    Complex stft_val(stft_outputs[ch][stft_idx + 0], stft_outputs[ch][stft_idx + 1]);
+                    Complex mask_val(scratch.istft_in[dst_idx + 0], scratch.istft_in[dst_idx + 1]);
+                    mask_val /= denom;
+                    Complex masked = stft_val * mask_val;
+                    scratch.istft_in[dst_idx + 0] = masked.real();
+                    scratch.istft_in[dst_idx + 1] = masked.imag();
                 }
             }
             
@@ -274,23 +322,22 @@ void Inference::PostProcessAndISTFT(const std::vector<float>& mask_output,
                 for (int t = 0; t < n_frames; ++t) {
                     // f=0 is DC component
                     int dst_idx = (0 * n_frames + t) * 2; 
-                    istft_in[dst_idx + 0] = 0.0f;
-                    istft_in[dst_idx + 1] = 0.0f;
+                    scratch.istft_in[dst_idx + 0] = 0.0f;
+                    scratch.istft_in[dst_idx + 1] = 0.0f;
                 }
             }
             
-            int approx_len = (n_frames - 1) * hop_length + n_fft;
-            output_channels[ch].resize(approx_len + n_fft); 
-            stft::compute_istft(istft_in.data(), n_freq, n_frames, n_fft, hop_length, win_length, 
-                                window.data(), true, approx_len, output_channels[ch].data());
+            scratch.output_channels[ch].resize(approx_len + n_fft);
+            stft::compute_istft(scratch.istft_in.data(), n_freq, n_frames, n_fft, hop_length, win_length,
+                                scratch.hann_window.data(), true, approx_len, scratch.output_channels[ch].data());
             if (ch == 0) n_samples_out = approx_len;
-            output_channels[ch].resize(n_samples_out);
+            scratch.output_channels[ch].resize(n_samples_out);
         }
 
         output_audio[stem].resize(channels * n_samples_out);
         for (int i = 0; i < n_samples_out; ++i) {
             for (int ch = 0; ch < channels; ++ch) {
-                output_audio[stem][ch + i * channels] = output_channels[ch][i];
+                output_audio[stem][ch + i * channels] = scratch.output_channels[ch][i];
             }
         }
     }
@@ -309,7 +356,9 @@ std::vector<std::vector<float>> Inference::Process(const std::vector<float>& inp
 // Pipeline Stages
 // =================================================================================================
 
-std::shared_ptr<Inference::ChunkState> Inference::PreProcessChunk(const std::vector<float>& chunk_audio, int id) {
+std::shared_ptr<Inference::ChunkState> Inference::PreProcessChunk(const std::vector<float>& chunk_audio,
+                                                                  int id,
+                                                                  CpuScratch& scratch) {
     auto state = std::make_shared<ChunkState>();
     state->id = id;
     state->input_audio = chunk_audio; // Copy
@@ -317,7 +366,7 @@ std::shared_ptr<Inference::ChunkState> Inference::PreProcessChunk(const std::vec
     if (chunk_audio.empty()) return state;
 
     // 1. STFT
-    ComputeSTFT(state->input_audio, state->stft_outputs, state->n_frames);
+    ComputeSTFT(state->input_audio, state->stft_outputs, state->n_frames, scratch);
 
     // 2. Prepare Input
     PrepareModelInput(state->stft_outputs, state->n_frames, state->stft_flattened);
@@ -328,8 +377,8 @@ std::shared_ptr<Inference::ChunkState> Inference::PreProcessChunk(const std::vec
 void Inference::RunInference(std::shared_ptr<ChunkState> state) {
     if (!state || state->stft_flattened.empty()) return;
 
-    // 3. Ensure Graph
-    if (!EnsureGraph(state->n_frames)) {
+    GraphState* graph = EnsureGraph(state->n_frames);
+    if (!graph) {
         return;
     }
 
@@ -339,9 +388,9 @@ void Inference::RunInference(std::shared_ptr<ChunkState> state) {
     // Prepare position data
     // Use cached vectors to avoid allocation
     int required_time_size = n_frames * n_bands;
-    if (pos_time_data_.size() != required_time_size) {
-        pos_time_data_.resize(required_time_size);
-        for(int i=0; i < required_time_size; ++i) pos_time_data_[i] = i % n_frames;
+    if (graph->pos_time_data.size() != required_time_size) {
+        graph->pos_time_data.resize(required_time_size);
+        for(int i=0; i < required_time_size; ++i) graph->pos_time_data[i] = i % n_frames;
     }
     
     int required_freq_size = n_bands * n_frames;
@@ -350,32 +399,39 @@ void Inference::RunInference(std::shared_ptr<ChunkState> state) {
     // Wait, pos_freq_data[i] = i % n_bands. 
     // This is valid regardless of n_frames as long as size is correct.
     // But we should regenerate if size changes.
-    if (pos_freq_data_.size() != required_freq_size) {
-        pos_freq_data_.resize(required_freq_size);
-        for(int i=0; i < required_freq_size; ++i) pos_freq_data_[i] = i % n_bands;
+    if (graph->pos_freq_data.size() != required_freq_size) {
+        graph->pos_freq_data.resize(required_freq_size);
+        for(int i=0; i < required_freq_size; ++i) graph->pos_freq_data[i] = i % n_bands;
     }
 
+    ggml_backend_t backend = model_->GetBackend();
+    const size_t input_bytes = ggml_nbytes(graph->input_tensor);
+    const size_t pos_time_bytes = ggml_nbytes(graph->pos_time);
+    const size_t pos_freq_bytes = ggml_nbytes(graph->pos_freq);
+    const size_t output_bytes = ggml_nbytes(graph->mask_out_tensor);
+
     // 4. Host -> Device
-    ggml_backend_tensor_set(input_tensor_, state->stft_flattened.data(), 0, ggml_nbytes(input_tensor_));
-    ggml_backend_tensor_set(pos_time_, pos_time_data_.data(), 0, ggml_nbytes(pos_time_));
-    ggml_backend_tensor_set(pos_freq_, pos_freq_data_.data(), 0, ggml_nbytes(pos_freq_));
+    ggml_backend_tensor_set(graph->input_tensor, state->stft_flattened.data(), 0, input_bytes);
+    ggml_backend_tensor_set(graph->pos_time, graph->pos_time_data.data(), 0, pos_time_bytes);
+    ggml_backend_tensor_set(graph->pos_freq, graph->pos_freq_data.data(), 0, pos_freq_bytes);
 
     // 5. Compute
-    ggml_backend_graph_compute(model_->GetBackend(), gf_);
+    enum ggml_status status = ggml_backend_graph_compute(backend, graph->gf);
 
     // 6. Device -> Host
-    // Avoid reallocation if size roughly matches? 
-    // ggml_nelements(mask_out_tensor_) is fixed for a given n_frames.
-    // state->mask_output is a vector. resize handles it (no op if same size).
-    state->mask_output.resize(ggml_nelements(mask_out_tensor_));
-    ggml_backend_tensor_get(mask_out_tensor_, state->mask_output.data(), 0, ggml_nbytes(mask_out_tensor_));
+    state->mask_output.resize(ggml_nelements(graph->mask_out_tensor));
+    ggml_backend_tensor_get(graph->mask_out_tensor, state->mask_output.data(), 0, output_bytes);
+
+    if (status != GGML_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string("GGML graph compute failed: ") + ggml_status_to_string(status));
+    }
 }
 
-void Inference::PostProcessChunk(std::shared_ptr<ChunkState> state) {
+void Inference::PostProcessChunk(std::shared_ptr<ChunkState> state, CpuScratch& scratch) {
     if (!state || state->mask_output.empty()) return;
 
     // 7. Post-Process & ISTFT
-    PostProcessAndISTFT(state->mask_output, state->stft_outputs, state->n_frames, state->final_audio);
+    PostProcessAndISTFT(state->mask_output, state->stft_outputs, state->n_frames, state->final_audio, scratch);
 
     // 8. Trim
     for (auto& stem_audio : state->final_audio) {
@@ -389,9 +445,11 @@ void Inference::PostProcessChunk(std::shared_ptr<ChunkState> state) {
 
 std::vector<std::vector<float>> Inference::ProcessChunk(const std::vector<float>& chunk_audio) {
     // Serial fallback
-    auto state = PreProcessChunk(chunk_audio, 0);
+    CpuScratch preprocess_scratch;
+    CpuScratch postprocess_scratch;
+    auto state = PreProcessChunk(chunk_audio, 0, preprocess_scratch);
     RunInference(state);
-    PostProcessChunk(state);
+    PostProcessChunk(state, postprocess_scratch);
     return state->final_audio;
 }
 
@@ -625,11 +683,12 @@ std::vector<std::vector<float>> Inference::ProcessOverlapAddPipelined(const std:
     // 1. Preprocessor Thread
     auto preproccessor = std::thread([&]() {
         try {
+            CpuScratch preprocess_scratch;
             int current_offset = 0;
             while (current_offset < n_padded_samples && !cancel_requested.load(std::memory_order_acquire)) {
                 std::vector<float> chunk = extract_chunk(current_offset);
                 
-                auto state = PreProcessChunk(chunk, current_offset); 
+                auto state = PreProcessChunk(chunk, current_offset, preprocess_scratch);
                 
                 input_queue.Push(state);
                 if (cancel_requested.load(std::memory_order_acquire)) {
@@ -646,10 +705,11 @@ std::vector<std::vector<float>> Inference::ProcessOverlapAddPipelined(const std:
     // 3. Postprocessor Thread
     auto postprocessor = std::thread([&]() {
         try {
+            CpuScratch postprocess_scratch;
             std::shared_ptr<ChunkState> state;
             while (!cancel_requested.load(std::memory_order_acquire) && output_queue.Pop(state)) {
                 // This does ISTFT (CPU intensive)
-                PostProcessChunk(state);
+                PostProcessChunk(state, postprocess_scratch);
                 if (cancel_requested.load(std::memory_order_acquire)) {
                     break;
                 }

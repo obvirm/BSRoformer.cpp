@@ -62,6 +62,20 @@ Options:
 
 ---
 
+## Backend Quality and Performance Notes
+
+Backend availability is controlled by the ggml build configuration. The application initializes ggml's default best backend and does not expose a general project-level backend selector. For compatibility with existing integrations, `BSR_FORCE_CPU=1` remains available as a CPU-only override.
+
+Vulkan keeps `NV_coopmat2` enabled by default for user inference, because q8/fp16 models are the common performance path. For conservative numerical validation or troubleshooting, set:
+
+```bash
+GGML_VK_DISABLE_COOPMAT2=1
+```
+
+FP32 golden tests are correctness diagnostics for graph/backend changes. They are not the default performance target for typical q8/fp16 user inference.
+
+---
+
 ## 🔧 Building from Source
 
 ### Prerequisites
@@ -290,6 +304,15 @@ ctest --test-dir build -C Release
 # Run specific test
 ctest --test-dir build -C Release -R test_inference
 ```
+
+For Vulkan correctness checks, use the conservative ggml path:
+
+```powershell
+$env:GGML_VK_DISABLE_COOPMAT2 = "1"
+ctest --test-dir build -C Release --output-on-failure
+```
+
+CLI wall-time benchmarks are available in `scripts/benchmark.ps1`. Final WAV comparisons are available in `scripts/compare_wav.py`.
 
 ### Test Suite
 
