@@ -1,0 +1,223 @@
+name: Publish Draft Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to create or update, for example v0.1.0'
+        required: true
+        type: string
+      release_name:
+        description: 'Release title. Defaults to tag_name when empty.'
+        required: false
+        type: string
+        default: ''
+      branch:
+        description: 'Branch whose latest successful CI run should be used. Defaults to the current branch.'
+        required: false
+        type: string
+        default: ''
+      ci_run_id:
+        description: 'Optional CI run id to publish. When empty, the latest successful CI run is used.'
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: 'Mark the draft release as a prerelease.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Publish latest CI artifacts to draft release
+    runs-on: ubuntu-latest
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG_NAME: ${{ inputs.tag_name }}
+      RELEASE_NAME: ${{ inputs.release_name }}
+      REQUESTED_BRANCH: ${{ inputs.branch }}
+      REQUESTED_CI_RUN_ID: ${{ inputs.ci_run_id }}
+      PRERELEASE: ${{ inputs.prerelease }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select CI run
+        id: select-run
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          branch="${REQUESTED_BRANCH:-${GITHUB_REF_NAME}}"
+
+          if [[ -n "${REQUESTED_CI_RUN_ID}" ]]; then
+            run_json="$(gh run view "${REQUESTED_CI_RUN_ID}" \
+              --json databaseId,headSha,headBranch,conclusion,status,workflowName,createdAt,url)"
+          else
+            run_json="$(gh run list \
+              --workflow build.yml \
+              --branch "${branch}" \
+              --status success \
+              --limit 1 \
+              --json databaseId,headSha,headBranch,conclusion,status,workflowName,createdAt,url \
+              --jq '.[0]')"
+          fi
+
+          if [[ -z "${run_json}" || "${run_json}" == "null" ]]; then
+            echo "No successful CI run found for branch '${branch}'." >&2
+            exit 1
+          fi
+
+          workflow_name="$(jq -r '.workflowName' <<< "${run_json}")"
+          if [[ "${workflow_name}" != "CI" ]]; then
+            echo "Run ${REQUESTED_CI_RUN_ID} belongs to '${workflow_name}', expected 'CI'." >&2
+            exit 1
+          fi
+
+          status="$(jq -r '.status' <<< "${run_json}")"
+          conclusion="$(jq -r '.conclusion' <<< "${run_json}")"
+          if [[ "${status}" != "completed" || "${conclusion}" != "success" ]]; then
+            echo "Run ${REQUESTED_CI_RUN_ID:-latest} is ${status}/${conclusion}, expected completed/success." >&2
+            exit 1
+          fi
+
+          run_id="$(jq -r '.databaseId' <<< "${run_json}")"
+          head_sha="$(jq -r '.headSha' <<< "${run_json}")"
+          head_branch="$(jq -r '.headBranch' <<< "${run_json}")"
+          created_at="$(jq -r '.createdAt' <<< "${run_json}")"
+          run_url="$(jq -r '.url' <<< "${run_json}")"
+
+          {
+            echo "run_id=${run_id}"
+            echo "head_sha=${head_sha}"
+            echo "head_branch=${head_branch}"
+            echo "created_at=${created_at}"
+            echo "run_url=${run_url}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Selected CI run"
+            echo ""
+            echo "- Run: [${run_id}](${run_url})"
+            echo "- Branch: ${head_branch}"
+            echo "- Commit: ${head_sha}"
+            echo "- Created: ${created_at}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.select-run.outputs.run_id }}
+          pattern: BSRoformer-*
+          path: downloaded-artifacts
+          github-token: ${{ github.token }}
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import shutil
+          import sys
+
+          artifacts_dir = Path("downloaded-artifacts")
+          assets_dir = Path("release-assets")
+          assets_dir.mkdir(exist_ok=True)
+
+          artifact_dirs = sorted(p for p in artifacts_dir.iterdir() if p.is_dir() and p.name.startswith("BSRoformer-"))
+          if not artifact_dirs:
+              print("No BSRoformer-* artifacts were downloaded.", file=sys.stderr)
+              sys.exit(1)
+
+          packaged = []
+          for artifact_dir in artifact_dirs:
+              for cli in artifact_dir.rglob("bs_roformer-cli"):
+                  if cli.is_file():
+                      cli.chmod(cli.stat().st_mode | 0o755)
+              archive_base = assets_dir / artifact_dir.name
+              archive_path = Path(shutil.make_archive(str(archive_base), "zip", root_dir=artifact_dir))
+              packaged.append(archive_path)
+
+          manifest = assets_dir / "release-manifest.txt"
+          manifest.write_text(
+              "\n".join(
+                  [
+                      f"tag={os.environ['TAG_NAME']}",
+                      f"ci_run_id={os.environ['CI_RUN_ID']}",
+                      f"ci_run_url={os.environ['CI_RUN_URL']}",
+                      f"ci_head_branch={os.environ['CI_HEAD_BRANCH']}",
+                      f"ci_head_sha={os.environ['CI_HEAD_SHA']}",
+                      "",
+                      "assets:",
+                      *[f"- {path.name}" for path in packaged],
+                  ]
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+
+          print("Packaged release assets:")
+          for path in packaged:
+              print(f"- {path}")
+          print(f"- {manifest}")
+          PY
+        env:
+          CI_RUN_ID: ${{ steps.select-run.outputs.run_id }}
+          CI_RUN_URL: ${{ steps.select-run.outputs.run_url }}
+          CI_HEAD_BRANCH: ${{ steps.select-run.outputs.head_branch }}
+          CI_HEAD_SHA: ${{ steps.select-run.outputs.head_sha }}
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          Draft release generated from CI artifacts.
+
+          - CI run: [${{ steps.select-run.outputs.run_id }}](${{ steps.select-run.outputs.run_url }})
+          - Branch: ${{ steps.select-run.outputs.head_branch }}
+          - Commit: ${{ steps.select-run.outputs.head_sha }}
+          - CI created at: ${{ steps.select-run.outputs.created_at }}
+          EOF
+
+      - name: Create or update draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_name="${RELEASE_NAME:-${TAG_NAME}}"
+          release_flags=(--draft --notes-file release-notes.md --title "${release_name}" --target "${CI_HEAD_SHA}")
+
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            release_flags+=(--prerelease)
+          fi
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release edit "${TAG_NAME}" "${release_flags[@]}"
+          else
+            gh release create "${TAG_NAME}" "${release_flags[@]}"
+          fi
+
+          gh release upload "${TAG_NAME}" release-assets/* --clobber
+
+          {
+            echo "## Draft release"
+            echo ""
+            echo "- Tag: ${TAG_NAME}"
+            echo "- Title: ${release_name}"
+            echo "- Assets:"
+            find release-assets -maxdepth 1 -type f -printf '  - %f\n' | sort
+          } >> "${GITHUB_STEP_SUMMARY}"
+        env:
+          CI_HEAD_SHA: ${{ steps.select-run.outputs.head_sha }}
