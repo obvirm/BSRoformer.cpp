@@ -125,10 +125,11 @@ jobs:
           set -euo pipefail
 
           python - <<'PY'
-          from pathlib import Path
           import os
-          import shutil
           import sys
+          import tarfile
+          import zipfile
+          from pathlib import Path
 
           artifacts_dir = Path("downloaded-artifacts")
           assets_dir = Path("release-assets")
@@ -144,8 +145,23 @@ jobs:
               for cli in artifact_dir.rglob("bs_roformer-cli"):
                   if cli.is_file():
                       cli.chmod(cli.stat().st_mode | 0o755)
-              archive_base = assets_dir / artifact_dir.name
-              archive_path = Path(shutil.make_archive(str(archive_base), "zip", root_dir=artifact_dir))
+
+              if "windows" in artifact_dir.name.lower():
+                  archive_path = assets_dir / f"{artifact_dir.name}.zip"
+                  with zipfile.ZipFile(
+                      archive_path,
+                      "w",
+                      compression=zipfile.ZIP_DEFLATED,
+                      compresslevel=9,
+                  ) as archive:
+                      for path in sorted(p for p in artifact_dir.rglob("*") if p.is_file()):
+                          archive.write(path, path.relative_to(artifact_dir).as_posix())
+              else:
+                  archive_path = assets_dir / f"{artifact_dir.name}.tar.xz"
+                  with tarfile.open(archive_path, "w:xz", preset=9) as archive:
+                      for path in sorted(p for p in artifact_dir.rglob("*") if p.is_file()):
+                          archive.add(path, arcname=path.relative_to(artifact_dir).as_posix())
+
               packaged.append(archive_path)
 
           manifest = assets_dir / "release-manifest.txt"
