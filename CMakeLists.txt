@@ -108,7 +108,7 @@ else()
 endif()
 
 #================================================
-# DLL Copy Helper (Windows)
+# DLL Copy Helper (Windows) — must be BEFORE targets that use it
 #================================================
 
 function(bsr_copy_ggml_runtime_dlls target_name)
@@ -151,6 +151,56 @@ function(bsr_copy_ggml_runtime_dlls target_name)
         )
     endif()
 endfunction()
+
+#================================================
+# Shared Library (C API) — for ctypes binding
+#================================================
+
+option(BSR_BUILD_SHARED "Build shared library (bs_roformer.dll/.so)" ON)
+
+if(BSR_BUILD_SHARED)
+    add_library(bs_roformer_shared SHARED
+        ${BSR_SOURCES}
+        src/bs_roformer_c_api.cpp
+    )
+    
+    target_include_directories(bs_roformer_shared PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_include_directories(bs_roformer_shared PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(bs_roformer_shared PUBLIC ggml)
+    if(GGML_CUDA AND TARGET ggml-cuda)
+        find_package(CUDAToolkit REQUIRED)
+        if(TARGET CUDA::cuda_driver)
+            target_link_libraries(bs_roformer_shared PUBLIC CUDA::cuda_driver)
+            message(STATUS "Linked against CUDA driver stubs")
+        endif()
+    endif()
+
+    if(MSVC)
+        target_compile_options(bs_roformer_shared PRIVATE /W3 /utf-8)
+    else()
+        target_compile_options(bs_roformer_shared PRIVATE -Wall -Wextra)
+    endif()
+    
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(bs_roformer_shared PUBLIC OpenMP::OpenMP_CXX)
+        target_compile_definitions(bs_roformer_shared PUBLIC USE_OPENMP)
+    endif()
+    
+    set_target_properties(bs_roformer_shared PROPERTIES
+        OUTPUT_NAME "bs_roformer"
+        MSVC_RUNTIME_DYNAMIC ON
+    )
+    
+    target_compile_definitions(bs_roformer_shared PRIVATE BSR_BUILD_DLL)
+    
+    bsr_copy_ggml_runtime_dlls(bs_roformer_shared)
+endif()
 
 #================================================
 # CLI Application
