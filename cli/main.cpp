@@ -4,9 +4,14 @@
 #include <string>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
+#include <io.h>
+#include <fcntl.h>
 
 void print_usage(const char* program_name) {
-    std::cerr << "Usage: " << program_name << " <model.gguf> <input.wav> <output.wav> [options]" << std::endl;
+    std::cerr << "Usage: " << program_name << " <model.gguf> <input.wav|-> <output.wav|-> [options]" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "  Use '-' for input/output to read/write via pipe (no temp files)." << std::endl;
     std::cerr << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --chunk-size <N>   Chunk size in samples (default: from model, fallback 352800)" << std::endl;
@@ -38,6 +43,8 @@ int main(int argc, char* argv[]) {
     std::string model_path = argv[1];
     std::string input_path = argv[2];
     std::string output_path = argv[3];
+    bool pipe_in = (input_path == "-");
+    bool pipe_out = (output_path == "-" || output_path == "--stdout");
     
     // Parse optional arguments
     for (int i = 4; i < argc; ++i) {
@@ -74,9 +81,21 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        std::cout << "Initializing BSRoformer..." << std::endl;
-        auto start_time = std::chrono::high_resolution_clock::now();
+        std::cerr << "Initializing BSRoformer..." << std::endl;
         
+        // Suppress stdout — ggml + inference print debug junk there
+        int saved_stdout = -1;
+        if (pipe_out) {
+            fflush(stdout);
+            saved_stdout = _dup(1);
+            FILE* devnull = fopen("NUL", "w");
+            if (devnull) {
+                _dup2(_fileno(devnull), 1);
+                fclose(devnull);
+            }
+        }
+        
+        auto start_time = std::chrono::high_resolution_clock::now();
         Inference engine(model_path);
         
         // Use model defaults if not explicitly set by user
@@ -87,16 +106,29 @@ int main(int argc, char* argv[]) {
             num_overlap = engine.GetDefaultNumOverlap();
         }
         
-        std::cout << "Loading audio: " << input_path << std::endl;
-        AudioBuffer input_audio = AudioFile::Load(input_path);
+        std::cerr << "Loading audio: " << input_path << std::endl;
+        AudioBuffer input_audio;
+        if (input_path == "-") {
+            _setmode(_fileno(stdin), _O_BINARY);
+            std::vector<char> stdin_data;
+            char buf[65536];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) {
+                stdin_data.insert(stdin_data.end(), buf, buf + n);
+            }
+            input_audio = AudioFile::LoadFromMemory(stdin_data.data(), stdin_data.size());
+            std::cerr << "Read " << stdin_data.size() << " bytes from stdin" << std::endl;
+        } else {
+            input_audio = AudioFile::Load(input_path);
+        }
         
-        std::cout << "Audio loaded: " << input_audio.samples << " samples, " 
+        std::cerr << "Audio loaded: " << input_audio.samples << " samples, " 
                   << input_audio.channels << " channels, " 
                   << input_audio.sampleRate << " Hz" << std::endl;
 
         // 1. Check Sample Rate
         int required_sr = engine.GetSampleRate();
-        std::cout << "Model expects sample rate: " << required_sr << " Hz" << std::endl;
+        std::cerr << "Model expects sample rate: " << required_sr << " Hz" << std::endl;
 
         if (input_audio.sampleRate != required_sr) {
             throw std::runtime_error("Input audio sample rate must be " + std::to_string(required_sr) + 
@@ -105,7 +137,7 @@ int main(int argc, char* argv[]) {
 
         // 2. Check Channels & Auto-Expand Mono
         if (input_audio.channels == 1) {
-             std::cout << "[Info] Input is Mono. Expanding to Stereo..." << std::endl;
+             std::cerr << "[Info] Input is Mono. Expanding to Stereo..." << std::endl;
              std::vector<float> stereo_data(input_audio.samples * 2);
              for(size_t i=0; i<input_audio.samples; ++i) {
                  stereo_data[i*2 + 0] = input_audio.data[i];
@@ -120,40 +152,40 @@ int main(int argc, char* argv[]) {
              throw std::runtime_error("Input audio must be Stereo (2 channels) or Mono (1 channel). Current: " + std::to_string(input_audio.channels));
         }
 
-        std::cout << "Processing with chunk_size=" << chunk_size 
+        std::cerr << "Processing with chunk_size=" << chunk_size 
                   << ", overlap=" << num_overlap << std::endl;
         auto process_start = std::chrono::high_resolution_clock::now();
         
         // Progress Bar Callback
         auto progress_callback = [](float progress) {
             int barWidth = 50;
-            std::cout << "[";
+            std::cerr << "[";
             int pos = barWidth * progress;
             for (int i = 0; i < barWidth; ++i) {
-                if (i < pos) std::cout << "=";
-                else if (i == pos) std::cout << ">";
-                else std::cout << " ";
+                if (i < pos) std::cerr << "=";
+                else if (i == pos) std::cerr << ">";
+                else std::cerr << " ";
             }
-            std::cout << "] " << int(progress * 100.0) << " %\r";
-            std::cout.flush();
+            std::cerr << "] " << int(progress * 100.0) << " %\r";
+            std::cerr.flush();
         };
 
         std::vector<std::vector<float>> output_stems = engine.Process(input_audio.data, chunk_size, num_overlap, progress_callback);
 
         // Clear progress line
-        std::cout << std::string(70, ' ') << "\r";
+        std::cerr << std::string(70, ' ') << "\r";
 
         auto process_end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> diff = process_end - process_start;
-        std::cout << "Processed in " << diff.count() << " seconds." << std::endl;
+        std::cerr << "Processed in " << diff.count() << " seconds." << std::endl;
         
         int num_stems = output_stems.size();
-        std::cout << "Model returned " << num_stems << " stems." << std::endl;
+        std::cerr << "Model returned " << num_stems << " stems." << std::endl;
 
         for (int i = 0; i < num_stems; ++i) {
-            // Prepare output filename
+            // Prepare output filename (skip stem suffix if piping)
             std::string current_output_path = output_path;
-            if (num_stems > 1) {
+            if (!pipe_out && num_stems > 1) {
                 // Insert _stem_i before extension
                 size_t dot_pos = output_path.find_last_of(".");
                 if (dot_pos != std::string::npos) {
@@ -170,11 +202,25 @@ int main(int argc, char* argv[]) {
             output_audio_buf.sampleRate = required_sr;
             output_audio_buf.samples = output_audio_buf.data.size();
             
-            std::cout << "Saving output stem " << i << ": " << current_output_path << std::endl;
-            AudioFile::Save(current_output_path, output_audio_buf);
+            std::cerr << "Saving output stem " << i << ": " << current_output_path << std::endl;
+            if (pipe_out) {
+                // Restore stdout for binary WAV output
+                if (saved_stdout != -1) {
+                    fflush(stdout);
+                    _dup2(saved_stdout, 1);
+                    _close(saved_stdout);
+                    saved_stdout = -1;
+                }
+                _setmode(_fileno(stdout), _O_BINARY);
+                auto wav_bytes = AudioFile::SaveToMemory(output_audio_buf);
+                fwrite(wav_bytes.data(), 1, wav_bytes.size(), stdout);
+                fflush(stdout);
+            } else {
+                AudioFile::Save(current_output_path, output_audio_buf);
+            }
         }
         
-        std::cout << "Done!" << std::endl;
+        std::cerr << "Done!" << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

@@ -35,4 +35,10 @@ public:
      * @throws std::runtime_error if the file cannot be written
      */
     static void Save(const std::string& path, const AudioBuffer& buffer);
+
+    /** Load WAV from raw memory buffer. */
+    static AudioBuffer LoadFromMemory(const void* data, size_t size);
+
+    /** Save WAV to a memory buffer (caller must free with drwav_free or use returned vector). */
+    static std::vector<char> SaveToMemory(const AudioBuffer& buffer);
 };
