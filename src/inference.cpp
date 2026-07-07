@@ -17,11 +17,56 @@
 #include <exception>
 #include <stdexcept>
 
+#if defined(_WIN32)
+#include <windows.h>
+#elif defined(__linux__)
+#include <sys/sysinfo.h>
+#elif defined(__APPLE__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#endif
+
 using Complex = std::complex<float>;
 static constexpr const char* kInferenceCancelledMessage = "Inference cancelled";
 
 namespace {
-constexpr size_t kGraphContextSize = 1024ull * 1024 * 1024;
+
+size_t detect_free_ram_mb() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX stat;
+    stat.dwLength = sizeof(stat);
+    if (GlobalMemoryStatusEx(&stat)) {
+        return stat.ullAvailPhys / (1024ULL * 1024ULL);
+    }
+#elif defined(__linux__)
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        return (si.mem_unit * si.freeram) / (1024ULL * 1024ULL);
+    }
+#elif defined(__APPLE__)
+    unsigned long long free_mem = 0;
+    size_t size = sizeof(free_mem);
+    if (sysctlbyname("hw.memsize", &free_mem, &size, nullptr, 0) == 0) {
+        // Approximate: use 20% of total as free estimate
+        return (free_mem * 20 / 100) / (1024ULL * 1024ULL);
+    }
+#endif
+    // Fallback: assume 4GB free
+    return 4096;
+}
+
+size_t calc_graph_context_size() {
+    size_t free_mb = detect_free_ram_mb();
+    // Use max 25% of free RAM, min 256MB, max 1GB
+    size_t alloc_mb = free_mb / 4;
+    if (alloc_mb < 256) alloc_mb = 256;
+    if (alloc_mb > 1024) alloc_mb = 1024;
+    std::cout << "[BSRoformer] Free RAM: " << free_mb << " MB, graph context: " << alloc_mb << " MB" << std::endl;
+    return alloc_mb * 1024ULL * 1024ULL;
+}
+
+size_t kGraphContextSize = calc_graph_context_size();
 constexpr int kGraphCapacity = 65536;
 }
 
